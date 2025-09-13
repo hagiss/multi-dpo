@@ -298,24 +298,40 @@ class VideoDataset(torch.utils.data.Dataset):
             frames = _frames
         num_frames = len(frames)
         if num_frames > self.num_frames:
-            num_frames = self.num_frames
+            if self.num_frames <= 1:
+                indices = [0]
+            else:
+                indices = torch.linspace(0, num_frames - 1, steps=self.num_frames).to(torch.int64).tolist()
+            frames = [frames[i] for i in indices]
         else:
             while num_frames > 1 and num_frames % self.time_division_factor != self.time_division_remainder:
                 num_frames -= 1
-        frames = frames[:num_frames]
+            frames = frames[:num_frames]
         return frames
     
     def load_video(self, file_path):
         if file_path.lower().endswith(".gif"):
             return self._load_gif(file_path)
         reader = imageio.get_reader(file_path)
-        num_frames = self.get_num_frames(reader)
+        total_frames = int(reader.count_frames())
         frames = []
-        for frame_id in range(num_frames):
-            frame = reader.get_data(frame_id)
-            frame = Image.fromarray(frame)
-            frame = self.crop_and_resize(frame, *self.get_height_width(frame))
-            frames.append(frame)
+        if total_frames > self.num_frames:
+            if self.num_frames <= 1:
+                indices = [0]
+            else:
+                indices = torch.linspace(0, total_frames - 1, steps=self.num_frames).to(torch.int64).tolist()
+            for frame_id in indices:
+                frame = reader.get_data(int(frame_id))
+                frame = Image.fromarray(frame)
+                frame = self.crop_and_resize(frame, *self.get_height_width(frame))
+                frames.append(frame)
+        else:
+            num_frames = self.get_num_frames(reader)
+            for frame_id in range(num_frames):
+                frame = reader.get_data(frame_id)
+                frame = Image.fromarray(frame)
+                frame = self.crop_and_resize(frame, *self.get_height_width(frame))
+                frames.append(frame)
         reader.close()
         return frames
     
@@ -362,6 +378,32 @@ class VideoDataset(torch.utils.data.Dataset):
         return len(self.data) * self.repeat
 
 
+class DPOVideoDataset(VideoDataset):
+    def __init__(self, *args, **kwargs):
+        if 'args' in kwargs and kwargs['args'] is not None:
+            kwargs['args'].data_file_keys = "win_video_path,lose_video_path"
+        elif 'data_file_keys' not in kwargs:
+            kwargs['data_file_keys'] = ("win_video_path", "lose_video_path")
+        super().__init__(*args, **kwargs)
+
+    def __getitem__(self, data_id):
+        data = self.data[data_id % len(self.data)].copy()
+        
+        win_video = self.load_data(os.path.join(self.base_path, data["win_video_path"]))
+        if win_video is None:
+            warnings.warn(f"cannot load file {data['win_video_path']}.")
+            return None
+        
+        lose_video = self.load_data(os.path.join(self.base_path, data["lose_video_path"]))
+        if lose_video is None:
+            warnings.warn(f"cannot load file {data['lose_video_path']}.")
+            return None
+
+        return {
+            "prompt": data["prompt"],
+            "win_video": win_video,
+            "lose_video": lose_video,
+        }
 
 class DiffusionTrainingModule(torch.nn.Module):
     def __init__(self):
@@ -489,15 +531,31 @@ class ModelLogger:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
 
 
+    # def on_epoch_end(self, accelerator, model, epoch_id):
+    #     accelerator.wait_for_everyone()
+    #     if accelerator.is_main_process:
+    #         state_dict = accelerator.get_state_dict(model)
+    #         state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
+    #         state_dict = self.state_dict_converter(state_dict)
+    #         os.makedirs(self.output_path, exist_ok=True)
+    #         path = os.path.join(self.output_path, f"epoch-{epoch_id}.safetensors")
+    #         accelerator.save(state_dict, path, safe_serialization=True)
     def on_epoch_end(self, accelerator, model, epoch_id):
         accelerator.wait_for_everyone()
-        if accelerator.is_main_process:
-            state_dict = accelerator.get_state_dict(model)
-            state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
-            state_dict = self.state_dict_converter(state_dict)
-            os.makedirs(self.output_path, exist_ok=True)
-            path = os.path.join(self.output_path, f"epoch-{epoch_id}.safetensors")
-            accelerator.save(state_dict, path, safe_serialization=True)
+        is_deepspeed = hasattr(accelerator.state, "deepspeed_plugin") and accelerator.state.deepspeed_plugin is not None
+        if is_deepspeed:
+            output_dir = os.path.join(self.output_path, f"epoch-{epoch_id}-deepspeed-checkpoint")
+            accelerator.save_state(output_dir)
+            if accelerator.is_main_process:
+                print(f"DeepSpeed sharded checkpoint saved to {output_dir}")
+        else:
+            if accelerator.is_main_process:
+                state_dict = accelerator.get_state_dict(model)
+                state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
+                state_dict = self.state_dict_converter(state_dict)
+                os.makedirs(self.output_path, exist_ok=True)
+                path = os.path.join(self.output_path, f"epoch-{epoch_id}.safetensors")
+                accelerator.save(state_dict, path, safe_serialization=True)
 
 
     def on_training_end(self, accelerator, model, save_steps=None):
@@ -507,13 +565,21 @@ class ModelLogger:
 
     def save_model(self, accelerator, model, file_name):
         accelerator.wait_for_everyone()
-        if accelerator.is_main_process:
-            state_dict = accelerator.get_state_dict(model)
-            state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
-            state_dict = self.state_dict_converter(state_dict)
-            os.makedirs(self.output_path, exist_ok=True)
-            path = os.path.join(self.output_path, file_name)
-            accelerator.save(state_dict, path, safe_serialization=True)
+        is_deepspeed = hasattr(accelerator.state, "deepspeed_plugin") and accelerator.state.deepspeed_plugin is not None
+        if is_deepspeed:
+            base_name = os.path.splitext(file_name)[0]
+            output_dir = os.path.join(self.output_path, f"{base_name}-deepspeed-checkpoint")
+            accelerator.save_state(output_dir)
+            if accelerator.is_main_process:
+                print(f"DeepSpeed sharded checkpoint saved to {output_dir}")
+        else:
+            if accelerator.is_main_process:
+                state_dict = accelerator.get_state_dict(model)
+                state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
+                state_dict = self.state_dict_converter(state_dict)
+                os.makedirs(self.output_path, exist_ok=True)
+                path = os.path.join(self.output_path, file_name)
+                accelerator.save(state_dict, path, safe_serialization=True)
 
 
 def launch_training_task(
@@ -546,12 +612,24 @@ def launch_training_task(
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)],
     )
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    # Initialize Weights & Biases on main process if enabled
+    if args is not None and getattr(args, "use_wandb", False):
+        if accelerator.is_main_process:
+            try:
+                import wandb
+                wandb.init(
+                    project=getattr(args, "wandb_project", "diffsynth_studio"),
+                    name=getattr(args, "wandb_run_name", None),
+                    config=vars(args),
+                )
+            except Exception as e:
+                print(f"wandb init failed: {e}")
     
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
-                if dataset.load_from_cache:
+                if getattr(dataset, "load_from_cache", False):
                     loss = model({}, inputs=data)
                 else:
                     loss = model(data)
@@ -559,6 +637,17 @@ def launch_training_task(
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps)
                 scheduler.step()
+                # Log metrics to Weights & Biases if available
+                if args is not None and getattr(args, "use_wandb", False):
+                    if accelerator.is_main_process:
+                        try:
+                            import wandb
+                            model_unwrapped = accelerator.unwrap_model(model)
+                            metrics = getattr(model_unwrapped, "last_metrics", None)
+                            if metrics is not None:
+                                wandb.log(metrics)
+                        except Exception as e:
+                            print(f"wandb log failed: {e}")
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
     model_logger.on_training_end(accelerator, model, save_steps)
@@ -619,6 +708,11 @@ def wan_parser():
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
+    parser.add_argument("--dpo_beta", type=float, default=0.1, help="DPO beta.")
+    # wandb logging
+    parser.add_argument("--use_wandb", default=False, action="store_true", help="Enable Weights & Biases logging.")
+    parser.add_argument("--wandb_project", type=str, default="diffsynth_studio", help="Weights & Biases project name.")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Weights & Biases run name.")
     return parser
 
 

@@ -35,7 +35,7 @@ class WanVideoPipeline(BasePipeline):
             device=device, torch_dtype=torch_dtype,
             height_division_factor=16, width_division_factor=16, time_division_factor=4, time_division_remainder=1
         )
-        self.scheduler = FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
+        self.scheduler = FlowMatchScheduler(shift=1, sigma_min=0.0, extra_one_step=True) # uniform timesteps for dpo
         self.prompter = WanPrompter(tokenizer_path=tokenizer_path)
         self.text_encoder: WanTextEncoder = None
         self.image_encoder: WanImageEncoder = None
@@ -1266,13 +1266,13 @@ def model_fn_wan_video(
                     x = torch.utils.checkpoint.checkpoint(
                         create_custom_forward(block),
                         x, context, t_mod, freqs,
-                        use_reentrant=False,
+                        use_reentrant=True,
                     )
             elif use_gradient_checkpointing:
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     x, context, t_mod, freqs,
-                    use_reentrant=False,
+                    use_reentrant=True,
                 )
             else:
                 x = block(x, context, t_mod, freqs)
@@ -1367,23 +1367,23 @@ def model_fn_wans2v(
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(block),
                     x, context, t_mod, seq_len_x, pre_compute_freqs[0],
-                    use_reentrant=False,
+                    use_reentrant=True,
                 )
                 x = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(lambda x: dit.after_transformer_block(block_id, x, audio_emb_global, merged_audio_emb, seq_len_x)),
                     x,
-                    use_reentrant=False,
+                    use_reentrant=True,
                 )
         elif use_gradient_checkpointing:
             x = torch.utils.checkpoint.checkpoint(
                 create_custom_forward(block),
                 x, context, t_mod, seq_len_x, pre_compute_freqs[0],
-                use_reentrant=False,
+                use_reentrant=True,
             )
             x = torch.utils.checkpoint.checkpoint(
                 create_custom_forward(lambda x: dit.after_transformer_block(block_id, x, audio_emb_global, merged_audio_emb, seq_len_x)),
                 x,
-                use_reentrant=False,
+                use_reentrant=True,
             )
         else:
             x = block(x, context, t_mod, seq_len_x, pre_compute_freqs[0])

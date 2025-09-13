@@ -9,11 +9,13 @@ CACHE_T = 2
 
 
 def check_is_instance(model, module_class):
-    if isinstance(model, module_class):
-        return True
-    if hasattr(model, "module") and isinstance(model.module, module_class):
-        return True
-    return False
+    """DeepSpeed-aware isinstance check (handles ZeRO-3 wrappers)."""
+    m = model
+    depth = 0
+    while not isinstance(m, module_class) and hasattr(m, "module") and depth < 4:
+        m = m.module
+        depth += 1
+    return isinstance(m, module_class)
 
 
 def block_causal_mask(x, block_size):
@@ -171,7 +173,7 @@ class Resample(nn.Module):
                         torch.cat([feat_cache[idx][:, :, -1:, :, :], x], 2))
                     feat_cache[idx] = cache_x
                     feat_idx[0] += 1
-        return x
+        return x, feat_cache, feat_idx
 
     def init_weight(self, conv):
         conv_weight = conv.weight
@@ -282,23 +284,27 @@ class ResidualBlock(nn.Module):
 
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         h = self.shortcut(x)
-        for layer in self.residual:
-            if check_is_instance(layer, CausalConv3d) and feat_cache is not None:
-                idx = feat_idx[0]
-                cache_x = x[:, :, -CACHE_T:, :, :].clone()
-                if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
-                    # cache last frame of last two chunk
-                    cache_x = torch.cat([
-                        feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
-                            cache_x.device), cache_x
-                    ],
-                                        dim=2)
-                x = layer(x, feat_cache[idx])
-                feat_cache[idx] = cache_x
-                feat_idx[0] += 1
-            else:
-                x = layer(x)
-        return x + h
+        try:
+            for layer in self.residual:
+                if check_is_instance(layer, CausalConv3d) and feat_cache is not None:
+                    idx = feat_idx[0]
+                    cache_x = x[:, :, -CACHE_T:, :, :].clone()
+                    if cache_x.shape[2] < 2 and feat_cache[idx] is not None:
+                        # cache last frame of last two chunk
+                        cache_x = torch.cat([
+                            feat_cache[idx][:, :, -1, :, :].unsqueeze(2).to(
+                                cache_x.device), cache_x
+                        ],dim=2)
+                    x = layer(x, feat_cache[idx])
+                    feat_cache[idx] = cache_x
+                    feat_idx[0] += 1
+                else:
+                    x = layer(x)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            breakpoint()
+        return x + h, feat_cache, feat_idx
 
 
 class AttentionBlock(nn.Module):
@@ -319,6 +325,8 @@ class AttentionBlock(nn.Module):
         nn.init.zeros_(self.proj.weight)
 
     def forward(self, x):
+        if type(x) == tuple:
+            x = x[0]
         identity = x
         b, c, t, h, w = x.size()
         x = rearrange(x, 'b c t h w -> (b t) c h w')
@@ -469,7 +477,7 @@ class Down_ResidualBlock(nn.Module):
     def forward(self, x, feat_cache=None, feat_idx=[0]):
         x_copy = x.clone()
         for module in self.downsamples:
-            x = module(x, feat_cache, feat_idx)
+            x, feat_cache, feat_idx = module(x, feat_cache, feat_idx)
 
         return x + self.avg_shortcut(x_copy)
 
@@ -506,7 +514,7 @@ class Up_ResidualBlock(nn.Module):
     def forward(self, x, feat_cache=None, feat_idx=[0], first_chunk=False):
         x_main = x.clone()
         for module in self.upsamples:
-            x_main = module(x_main, feat_cache, feat_idx)
+            x_main, feat_cache, feat_idx = module(x_main, feat_cache, feat_idx)
         if self.avg_shortcut is not None:
             x_shortcut = self.avg_shortcut(x, first_chunk)
             return x_main + x_shortcut
@@ -586,14 +594,17 @@ class Encoder3d(nn.Module):
         ## downsamples
         for layer in self.downsamples:
             if feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx)
+                if check_is_instance(layer, (Resample, ResidualBlock)):
+                    x, feat_cache, feat_idx = layer(x, feat_cache, feat_idx)
+                else:
+                    x = layer(x)
             else:
                 x = layer(x)
 
         ## middle
         for layer in self.middle:
             if check_is_instance(layer, ResidualBlock) and feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx)
+                x, feat_cache, feat_idx = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
 
@@ -614,7 +625,7 @@ class Encoder3d(nn.Module):
                 feat_idx[0] += 1
             else:
                 x = layer(x)
-        return x
+        return x, feat_cache, feat_idx
 
 
 class Encoder3d_38(nn.Module):
@@ -705,7 +716,7 @@ class Encoder3d_38(nn.Module):
         ## middle
         for layer in self.middle:
             if isinstance(layer, ResidualBlock) and feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx)
+                x, feat_cache, feat_idx = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
 
@@ -807,14 +818,14 @@ class Decoder3d(nn.Module):
         ## middle
         for layer in self.middle:
             if check_is_instance(layer, ResidualBlock) and feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx)
+                x, feat_cache, feat_idx = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
 
         ## upsamples
         for layer in self.upsamples:
-            if feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx)
+            if feat_cache is not None and check_is_instance(layer, (Resample, ResidualBlock)):
+                x, feat_cache, feat_idx = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
 
@@ -906,7 +917,7 @@ class Decoder3d_38(nn.Module):
 
         for layer in self.middle:
             if check_is_instance(layer, ResidualBlock) and feat_cache is not None:
-                x = layer(x, feat_cache, feat_idx)
+                x, feat_cache, feat_idx = layer(x, feat_cache, feat_idx)
             else:
                 x = layer(x)
 
@@ -990,11 +1001,11 @@ class VideoVAE_(nn.Module):
         for i in range(iter_):
             self._enc_conv_idx = [0]
             if i == 0:
-                out = self.encoder(x[:, :, :1, :, :],
+                out, self._enc_feat_map, self._enc_conv_idx = self.encoder(x[:, :, :1, :, :],
                                    feat_cache=self._enc_feat_map,
                                    feat_idx=self._enc_conv_idx)
             else:
-                out_ = self.encoder(x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
+                out_, self._enc_feat_map, self._enc_conv_idx = self.encoder(x[:, :, 1 + 4 * (i - 1):1 + 4 * i, :, :],
                                     feat_cache=self._enc_feat_map,
                                     feat_idx=self._enc_conv_idx)
                 out = torch.cat([out, out_], 2)
@@ -1216,6 +1227,7 @@ class WanVideoVAE(nn.Module):
 
 
     def encode(self, videos, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
+
         videos = [video.to("cpu") for video in videos]
         hidden_states = []
         for video in videos:
@@ -1233,18 +1245,11 @@ class WanVideoVAE(nn.Module):
 
 
     def decode(self, hidden_states, device, tiled=False, tile_size=(34, 34), tile_stride=(18, 16)):
-        hidden_states = [hidden_state.to("cpu") for hidden_state in hidden_states]
-        videos = []
-        for hidden_state in hidden_states:
-            hidden_state = hidden_state.unsqueeze(0)
-            if tiled:
-                video = self.tiled_decode(hidden_state, device, tile_size, tile_stride)
-            else:
-                video = self.single_decode(hidden_state, device)
-            video = video.squeeze(0)
-            videos.append(video)
-        videos = torch.stack(videos)
-        return videos
+        if tiled:
+            video = self.tiled_decode(hidden_states, device, tile_size, tile_stride)
+        else:
+            video = self.single_decode(hidden_states, device)
+        return video
 
 
     @staticmethod
