@@ -625,29 +625,59 @@ def launch_training_task(
             except Exception as e:
                 print(f"wandb init failed: {e}")
     
+    # for epoch_id in range(num_epochs):
+    #     for data in tqdm(dataloader):
+    #         with accelerator.accumulate(model):
+    #             optimizer.zero_grad()
+    #             if getattr(dataset, "load_from_cache", False):
+    #                 loss = model({}, inputs=data)
+    #             else:
+    #                 loss = model(data)
+    #             accelerator.backward(loss)
+    #             optimizer.step()
+    #             model_logger.on_step_end(accelerator, model, save_steps)
+    #             scheduler.step()
+    #             # Log metrics to Weights & Biases if available
+    #             if args is not None and getattr(args, "use_wandb", False):
+    #                 if accelerator.is_main_process:
+    #                     try:
+    #                         import wandb
+    #                         model_unwrapped = accelerator.unwrap_model(model)
+    #                         metrics = getattr(model_unwrapped, "last_metrics", None)
+    #                         if metrics is not None:
+    #                             wandb.log(metrics)
+    #                     except Exception as e:
+    #                         print(f"wandb log failed: {e}")
+    #     if save_steps is None:
+    #         model_logger.on_epoch_end(accelerator, model, epoch_id)
+            
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
-            with accelerator.accumulate(model):
-                optimizer.zero_grad()
-                if getattr(dataset, "load_from_cache", False):
-                    loss = model({}, inputs=data)
-                else:
-                    loss = model(data)
-                accelerator.backward(loss)
-                optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps)
-                scheduler.step()
-                # Log metrics to Weights & Biases if available
-                if args is not None and getattr(args, "use_wandb", False):
-                    if accelerator.is_main_process:
-                        try:
-                            import wandb
-                            model_unwrapped = accelerator.unwrap_model(model)
-                            metrics = getattr(model_unwrapped, "last_metrics", None)
-                            if metrics is not None:
-                                wandb.log(metrics)
-                        except Exception as e:
-                            print(f"wandb log failed: {e}")
+            optimizer.zero_grad()
+
+            if getattr(dataset, "load_from_cache", False):
+                loss = model({}, inputs=data)
+            else:
+                loss = model(data)
+
+            accelerator.backward(loss)
+            # accelerator.optimizer_step(optimizer)  # ✅ DS handles grad accumulation internally
+            optimizer.step()
+            model_logger.on_step_end(accelerator, model, save_steps)
+            scheduler.step()
+
+            # Log metrics to Weights & Biases if available
+            if args is not None and getattr(args, "use_wandb", False):
+                if accelerator.is_main_process:
+                    try:
+                        import wandb
+                        model_unwrapped = accelerator.unwrap_model(model)
+                        metrics = getattr(model_unwrapped, "last_metrics", None)
+                        if metrics is not None:
+                            wandb.log(metrics)
+                    except Exception as e:
+                        print(f"wandb log failed: {e}")
+
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
     model_logger.on_training_end(accelerator, model, save_steps)

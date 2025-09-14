@@ -1,6 +1,6 @@
-accelerate launch --config_file examples/wanvideo/model_training/full/accelerate_config_14B.yaml examples/wanvideo/model_training/train.py \
-  --dataset_base_path train \
-  --dataset_metadata_path train/metadata.csv \
+CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 accelerate launch --config_file examples/wanvideo/model_training/full/accelerate_config_14B.yaml examples/wanvideo/model_training/train.py \
+  --dataset_base_path ../dpo/train \
+  --dataset_metadata_path ../dpo/train/dpo_dataset_single_all.csv \
   --num_frames 61 \
   --dataset_repeat 1 \
   --model_id_with_origin_paths "Wan-AI/Wan2.1-I2V-14B-720P:diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.1-I2V-14B-720P:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.1-I2V-14B-720P:Wan2.1_VAE.pth,Wan-AI/Wan2.1-I2V-14B-720P:models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth" \
@@ -13,6 +13,6 @@ accelerate launch --config_file examples/wanvideo/model_training/full/accelerate
   --lora_rank 128 \
   --extra_inputs "input_image" \
   --use_gradient_checkpointing_offload \
-  --gradient_accumulation_steps 4 \
+  --gradient_accumulation_steps 16 \
   --dpo_beta 500 \
   --use_wandb
