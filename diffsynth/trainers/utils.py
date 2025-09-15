@@ -605,7 +605,19 @@ def launch_training_task(
         find_unused_parameters = args.find_unused_parameters
     
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
+    # scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
+    # Define a linear warmup scheduler with constant lr after warmup
+    if args is not None and hasattr(args, "num_warmup_steps"):
+        num_warmup_steps = args.num_warmup_steps
+    else:
+        num_warmup_steps = 100  # default value, adjust as needed
+
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        return 1.0
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -653,30 +665,38 @@ def launch_training_task(
             
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
-            optimizer.zero_grad()
+            with accelerator.accumulate(model):
+                loss = model({}, inputs=data) if getattr(dataset, "load_from_cache", False) else model(data)
+                accelerator.backward(loss)
+                # Debug: check if weights change on non-boundary micro-steps
+                tracked_param = None
+                try:
+                    tracked_param = next(p for p in accelerator.unwrap_model(model).parameters() if p.requires_grad)
+                except StopIteration:
+                    tracked_param = None
+                pre_checksum = None
+                if tracked_param is not None and not accelerator.sync_gradients:
+                    pre_checksum = tracked_param.detach().float().sum().item()
 
-            if getattr(dataset, "load_from_cache", False):
-                loss = model({}, inputs=data)
-            else:
-                loss = model(data)
+                optimizer.step()
 
-            accelerator.backward(loss)
-            # accelerator.optimizer_step(optimizer)  # ✅ DS handles grad accumulation internally
-            optimizer.step()
-            model_logger.on_step_end(accelerator, model, save_steps)
-            scheduler.step()
+                if tracked_param is not None and not accelerator.sync_gradients and pre_checksum is not None:
+                    post_checksum = tracked_param.detach().float().sum().item()
+                    if accelerator.is_main_process:
+                        print(f"Non-boundary step: sync_gradients=False, weight_changed={abs(post_checksum - pre_checksum) > 0}")
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            # Log metrics to Weights & Biases if available
-            if args is not None and getattr(args, "use_wandb", False):
-                if accelerator.is_main_process:
-                    try:
-                        import wandb
-                        model_unwrapped = accelerator.unwrap_model(model)
-                        metrics = getattr(model_unwrapped, "last_metrics", None)
-                        if metrics is not None:
-                            wandb.log(metrics)
-                    except Exception as e:
-                        print(f"wandb log failed: {e}")
+                if args is not None and getattr(args, "use_wandb", False):
+                    if accelerator.is_main_process:
+                        try:
+                            import wandb
+                            model_unwrapped = accelerator.unwrap_model(model)
+                            metrics = getattr(model_unwrapped, "last_metrics", None)
+                            if metrics is not None:
+                                wandb.log(metrics)
+                        except Exception as e:
+                            print(f"wandb log failed: {e}")
 
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
