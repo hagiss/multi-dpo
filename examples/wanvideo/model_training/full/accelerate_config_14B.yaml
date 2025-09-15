@@ -1,7 +1,8 @@
 compute_environment: LOCAL_MACHINE
 debug: false
 deepspeed_config:
-  gradient_accumulation_steps: 16
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 4 # this value should be the same as the gradient_accumulation_steps in the training script
   offload_optimizer_device: cpu
   offload_param_device: cpu
   zero3_init_flag: true
