@@ -13,6 +13,6 @@ CUDA_VISIBLE_DEVICES=1,2,3,4,5,6,7 accelerate launch --config_file examples/wanv
   --lora_rank 128 \
   --extra_inputs "input_image" \
   --use_gradient_checkpointing_offload \
-  --gradient_accumulation_steps 16 \
+  --gradient_accumulation_steps 4 \   # this value should be the same as the gradient_accumulation_steps in the ds script
   --dpo_beta 500 \
   --use_wandb

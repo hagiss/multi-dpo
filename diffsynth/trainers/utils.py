@@ -610,11 +610,12 @@ def launch_training_task(
     if args is not None and hasattr(args, "num_warmup_steps"):
         num_warmup_steps = args.num_warmup_steps
     else:
-        num_warmup_steps = 100  # default value, adjust as needed
+        num_warmup_steps = 50
 
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
+            ret = float(current_step) / float(max(1, num_warmup_steps))
+            return max(ret, 0.01)
         return 1.0
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -668,22 +669,7 @@ def launch_training_task(
             with accelerator.accumulate(model):
                 loss = model({}, inputs=data) if getattr(dataset, "load_from_cache", False) else model(data)
                 accelerator.backward(loss)
-                # Debug: check if weights change on non-boundary micro-steps
-                tracked_param = None
-                try:
-                    tracked_param = next(p for p in accelerator.unwrap_model(model).parameters() if p.requires_grad)
-                except StopIteration:
-                    tracked_param = None
-                pre_checksum = None
-                if tracked_param is not None and not accelerator.sync_gradients:
-                    pre_checksum = tracked_param.detach().float().sum().item()
-
                 optimizer.step()
-
-                if tracked_param is not None and not accelerator.sync_gradients and pre_checksum is not None:
-                    post_checksum = tracked_param.detach().float().sum().item()
-                    if accelerator.is_main_process:
-                        print(f"Non-boundary step: sync_gradients=False, weight_changed={abs(post_checksum - pre_checksum) > 0}")
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
